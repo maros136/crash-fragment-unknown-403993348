@@ -1,0 +1,36 @@
+# Gradle files
+/.gradle/
+
+# IDEA files
+/.idea/
+/*.iml
+/app/*.iml
+
+# build files
+/build/
+/app/build/
+
+# Local configuration file (sdk path, etc)
+/local.properties
+
+# Android Studio captures folder
+captures/
+
+# Android Studio reports folder
+reports/
+
+# File browser configuration
+.directory
+
+
+gradlew.bat
+gradlew
+
+# Helper file with current GIT branch
+/app/build.desc
+/buildSrc/.gradle/
+/buildSrc/.gradle/buildOutputCleanup
+/buildSrc/.gradle/buildOutputCleanup/outputFiles.bin
+/buildSrc/.gradle/buildOutputCleanup/buildOutputCleanup.lock
+/buildSrc/.gradle/buildOutputCleanup/cache.properties
+/keystore.properties
