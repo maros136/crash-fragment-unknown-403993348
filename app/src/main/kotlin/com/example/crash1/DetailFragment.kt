@@ -1,52 +1,39 @@
 package com.example.crash1
 
+import android.annotation.SuppressLint
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import androidx.activity.BackEventCompat
-import androidx.activity.OnBackPressedCallback
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentManager
-import androidx.navigation.fragment.findNavController
 import com.google.android.material.transition.MaterialSharedAxis
 import com.example.crash1.databinding.FragmentDetailBinding
 
 /**
  * Crash — IllegalArgumentException: fragment unknown to FragmentNavigator
  *
- * ROOT CAUSE (confirmed by reading FragmentManager.java + FragmentNavigator.kt):
+ * Real crash stacktrace (Firebase):
+ *   FragmentNavigator$onAttach$2.onBackStackChangeCommitted (FragmentNavigator.kt:208)
+ *   FragmentManager.executeOpsTogether (FragmentManager.java:2188)
+ *   FragmentManager.execPendingActions (FragmentManager.java:2052)
+ *   FragmentManager.dispatchStateChange (FragmentManager.java:3327)
+ *   FragmentManager.dispatchPause / dispatchResume
+ *   ... (nested FM cascade) ...
+ *   FragmentActivity.onPause
+ *   ActivityThread.performPauseActivityIfNeeded
  *
- * Inside [handleOnBackPressed]:
- *   mHandlingTransitioningOp = true
- *   execPendingActions(true)                    ← commits the pop
- *     → executeOpsTogether
- *       → onBackStackChangeCommitted(frag, pop=true)   ← 1st call, entry removed
- *       [power button fires here — OS dispatches onPause on main thread]
- *       → dispatchPause → execPendingActions(true)     ← reentrant, mHandlingTransitioningOp=true
- *           → executeOpsTogether
- *             → onBackStackChangeCommitted(frag, pop=true)  ← 2nd call, entry==null → CRASH
- *
- * The reentrance comes from [dispatchPause] being called on the main thread while
- * [handleOnBackPressed] is still executing (power button pressed mid-gesture).
- *
- * PROGRAMMATIC APPROACH — inject a one-shot [OnBackStackChangedListener] that calls
- * [simulatePause] from within [onBackStackChangeCommitted]. At that exact moment,
- * [mHandlingTransitioningOp] is true, so the reentrant [execPendingActions] from
- * [dispatchPause] does NOT cancel [mTransitioningOp] — it processes it a second time,
- * firing [onBackStackChangeCommitted] again for the already-gone entry → CRASH.
- *
- * NO REFLECTION — [simulatePause] calls the protected [Activity.onPause] via
- * [MainActivity.simulatePause] which is a plain public method.
+ * Three independent reproduction methods:
+ *   A) Button — registers listener + starts gesture programmatically (no commit, gesture mid-flight)
+ *   B) Arm + gesture — swipe back triggers moveTaskToBack from onBackStackChangeStarted
+ *   C) Physical — swipe back + release + press POWER button during exit transition
  */
 class DetailFragment : Fragment() {
 
     private var _binding: FragmentDetailBinding? = null
     private val binding get() = _binding!!
-    private var armed = false
-    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,82 +47,101 @@ class DetailFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        binding.tvStatus.text = "Choose an option below.\n\nPhysical: swipe back + press power button."
+        binding.tvStatus.text =
+            "A) Trigger crash — programmatic gesture + moveTaskToBack\n" +
+            "B) Arm + swipe back — moveTaskToBack on gesture start\n" +
+            "C) Physical — swipe back + release + press POWER button"
+
+        binding.btnTriggerCrash.text = "▶  Option A: Trigger crash (button)"
+        binding.btnArmGesture.text = "🎯  Option B: Arm, then swipe back"
+
         binding.btnTriggerCrash.setOnClickListener { triggerWithButton() }
         binding.btnArmGesture.setOnClickListener { armForGesture() }
     }
 
-    // ── shared: inject the one-shot listener ─────────────────────────────────────────────────
-
-    /**
-     * Registers a one-shot [OnBackStackChangedListener] that fires [simulatePause] from
-     * inside [onBackStackChangeCommitted]. At that moment [mHandlingTransitioningOp] is
-     * `true`, so the reentrant [execPendingActions] from [dispatchPause] does NOT cancel
-     * [mTransitioningOp] — it re-executes it, firing [onBackStackChangeCommitted] a second
-     * time for the already-removed entry → CRASH.
-     */
-    private fun injectOneShotPauseTrigger() {
-        val activity = requireActivity() as MainActivity
-        parentFragmentManager.addOnBackStackChangedListener(
-            object : FragmentManager.OnBackStackChangedListener {
-                private var fired = false
-                override fun onBackStackChanged() {}
-                override fun onBackStackChangeStarted(fragment: Fragment, pop: Boolean) {}
-                override fun onBackStackChangeCancelled() {}
-                override fun onBackStackChangeCommitted(fragment: Fragment, pop: Boolean) {
-                    if (fired) return
-                    fired = true
-                    // Remove ourselves so we don't fire on future pops
-                    parentFragmentManager.removeOnBackStackChangedListener(this)
-                    // Simulate the power button press:
-                    // mHandlingTransitioningOp is true right now (we are inside
-                    // handleOnBackPressed → execPendingActions → executeOpsTogether).
-                    // simulatePause → dispatchPause → execPendingActions runs reentrant.
-                    // Because mHandlingTransitioningOp==true, the "cancel gesture" branch
-                    // is skipped → mTransitioningOp is committed a second time →
-                    // onBackStackChangeCommitted fires again → entry==null → CRASH
-                    activity.simulatePause()
-                    activity.simulateResume()
-                }
-            }
-        )
+    private fun log(msg: String) {
+        Log.e("CRASH1", msg)
+        _binding?.tvStatus?.text = msg
     }
 
-    // ── Option A: button ─────────────────────────────────────────────────────────────────────
-
+    // ── Option A — Button (programmatic) ─────────────────────────────────
+    // Combines the mechanism of Option B into a single button tap:
+    // registers the same onBackStackChangeStarted listener, then starts
+    // a predictive back gesture programmatically. The listener fires during
+    // dispatchOnBackStarted and calls moveTaskToBack, sending the app to
+    // background while the gesture is mid-flight.
+    @SuppressLint("RestrictedApi")
     private fun triggerWithButton() {
-        binding.tvStatus.text = "Injecting pause trigger — popping back stack..."
-        injectOneShotPauseTrigger()
-        // The predictive back path requires mTransitioningOp to be set.
-        // dispatchOnBackStarted → enqueueAction → mExecCommit sets mTransitioningOp.
-        // We then trigger the full gesture sequence programmatically.
+        binding.btnTriggerCrash.isEnabled = false
+        binding.btnArmGesture.isEnabled = false
+
+        // Install the same listener as Option B
+        val fm = parentFragmentManager
+        fm.addOnBackStackChangedListener(object : FragmentManager.OnBackStackChangedListener {
+            private var fired = false
+            override fun onBackStackChanged() {}
+            override fun onBackStackChangeStarted(fragment: Fragment, pop: Boolean) {
+                if (!pop || fired) return
+                fired = true
+                fm.removeOnBackStackChangedListener(this)
+                log("Option A: onBackStackChangeStarted → moveTaskToBack NOW")
+                requireActivity().moveTaskToBack(true)
+            }
+        })
+
         val dispatcher = requireActivity().onBackPressedDispatcher
+
+        log("Option A: starting predictive back gesture...")
         dispatcher.dispatchOnBackStarted(BackEventCompat(0f, 0f, 0f, BackEventCompat.EDGE_LEFT))
-        handler.post {
-            // mExecCommit has run → mTransitioningOp set → now commit the gesture
-            dispatcher.dispatchOnBackProgressed(
-                BackEventCompat(0.5f, 0f, 0f, BackEventCompat.EDGE_LEFT)
-            )
-            dispatcher.onBackPressed()
-            // onBackPressed → handleOnBackPressed → execPendingActions → executeOpsTogether
-            // → onBackStackChangeCommitted (1st) → our listener fires simulatePause
-            // → dispatchPause → execPendingActions (reentrant) → 2nd onBackStackChangeCommitted
-            // → entry==null → CRASH
-        }
+        dispatcher.dispatchOnBackProgressed(BackEventCompat(0.5f, 0f, 0f, BackEventCompat.EDGE_LEFT))
     }
 
-    // ── Option B: gesture ────────────────────────────────────────────────────────────────────
+    // ── Option B — Arm + gesture ─────────────────────────────────────────
+    // Registers a listener on onBackStackChangeStarted that immediately calls
+    // moveTaskToBack(true). When the user swipes back, the gesture starts,
+    // the listener fires, and the app goes to background mid-gesture.
+    // The OS PauseActivityItem arrives while the predictive back transition
+    // is in the seeking phase → dispatchPause → execPendingActions → crash.
+    private var armed = false
 
     private fun armForGesture() {
-        if (armed) { binding.tvStatus.text = "Already armed — swipe back from left edge."; return }
+        if (armed) { log("Already armed — swipe back now!"); return }
         armed = true
         binding.btnArmGesture.isEnabled = false
-        injectOneShotPauseTrigger()
-        binding.tvStatus.text = "✅ ARMED\n\nSwipe back from left edge and release.\nThe pause will be simulated automatically inside onBackStackChangeCommitted.\n\nOr: swipe back + press power button (physical)."
+        binding.btnTriggerCrash.isEnabled = false
+
+        val fm = parentFragmentManager
+        fm.addOnBackStackChangedListener(object : FragmentManager.OnBackStackChangedListener {
+            private var fired = false
+            override fun onBackStackChanged() {}
+
+            override fun onBackStackChangeStarted(fragment: Fragment, pop: Boolean) {
+                if (!pop || fired) return
+                fired = true
+                fm.removeOnBackStackChangedListener(this)
+                log("Option B: onBackStackChangeStarted → moveTaskToBack NOW")
+                requireActivity().moveTaskToBack(true)
+            }
+        })
+
+        log("✅ ARMED (Option B)\n\n" +
+            "Swipe back from left edge now.\n" +
+            "moveTaskToBack fires on gesture start → crash on onPause.\n\n" +
+            "For Option C (physical): navigate to Detail again,\n" +
+            "swipe back + release, then press POWER button within ~300ms.")
+    }
+
+    override fun onPause() {
+        super.onPause()
+        Log.e("CRASH1", "DetailFragment.onPause()")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Log.e("CRASH1", "DetailFragment.onResume()")
     }
 
     override fun onDestroyView() {
-        handler.removeCallbacksAndMessages(null)
         super.onDestroyView()
         _binding = null
     }
